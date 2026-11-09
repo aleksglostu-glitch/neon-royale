@@ -1,580 +1,367 @@
 /**
- * NEON ROYALE — игровой сервер (Bun + socket.io).
- * Протокол r:* (совпадает с клиентом):
- *   r:login {uid,nick} → {profile, nickTaken?, nick?}     — уникальные ники
- *   r:leaderboard {} → {ok, rows}                          — топ-100 по трофеям
- *   r:queue:start / r:queue:cancel                         — поиск пары (13.5с → бот)
- *   r:match:start {foe} / r:state (10 Гц) / r:battle:end   — сетевой бой 1v1
- *   r:deploy {cardIdx,x,y} → {ok}                          — выкладка карт (сервер валидирует)
- *   r:shop {action,card} → {ok,profile?,label?}            — магазин на сервере
- *   r:deck:save {deck} / r:cosmetics {towerSkin}           — колода и башни
- *   r:promo {code} → {ok, fox?, gold?, profile?}           — промокоды ТОЛЬКО здесь
- *   r:rejoin {} → {ok, battle?}                            — возврат в бой после обрыва
- *   r:battle:leave                                          — сдаться и выйти
- * Ник+очки не являются персональными данными (152-ФЗ): уведомление РКН не требуется.
+ * NEON ROYALE — игровой сервер (socket.io).
+ *
+ * Обязанности:
+ *  - регистрация уникальных ников (реестр + проверка занятости);
+ *  - таблица лидеров (топ-100 по трофеям, персистентность в JSON);
+ *  - матчмейкинг 1v1: очередь → пара игроков, либо через 15 с — матч с ботом;
+ *  - релей PvP (host-authoritative): play guest→host, snapshot host→guest;
+ *  - промокоды: код хранится XOR-обфусцированным, проверка ТОЛЬКО здесь,
+ *    rate-limit на попытки. В клиентском коде промокода нет.
+ *
+ * Персональные данные не собираются: только самодельный ник, playerId
+ * (случайный uuid из клиента) и игровые счётчики. 152-ФЗ не нарушается.
  */
 import { createServer } from 'http'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { Server, Socket } from 'socket.io'
-import {
-  Battle as RBattle,
-  BOT_NAMES,
-  botDeck,
-  type BattleView,
-  type PlayerCfg,
-  type Side,
-} from './game/engine'
-import {
-  CARD_MAP, CARDS, DEFAULT_DECK, MAX_CARD_LEVEL, MAX_TOWER_LEVEL, nextUpgradeCost, TOWER_LEVEL_COSTS,
-  towerSkin, towerUnlocked, TOWER_SKINS, validDeck,
-} from './game/cards'
-import type { Profile } from './game/profile'
 
-process.on('uncaughtException', (e) => console.error('[royale] uncaughtException:', e))
-process.on('unhandledRejection', (e) => console.error('[royale] unhandledRejection:', e))
+const PORT = Number(process.env.PORT || 3003)
 
-// ============================ ХРАНИЛИЩЕ ============================
-const DATA_DIR = (process.env.DATA_DIR || (existsSync('/data') ? '/data' : join(import.meta.dir, 'data')))
-const PLAYERS_PATH = join(DATA_DIR, 'players.json')
-const NICKS_PATH = join(DATA_DIR, 'nicks.json')
+const httpServer = createServer((req, res) => {
+  // CORS для REST
+  res.setHeader('Access-Control-Allow-Origin', '*')
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return }
 
-interface PlayerRec { profile: Profile; updatedAt: number }
-const players = new Map<string, PlayerRec>() // uid → rec
-const nickIndex = new Map<string, string>() // lowerNick → uid
-let storeDirty = false
-const markDirty = () => {
-  storeDirty = true
-}
-
-function loadStore() {
-  try {
-    if (existsSync(PLAYERS_PATH)) {
-      const data = JSON.parse(readFileSync(PLAYERS_PATH, 'utf8')) as Record<string, PlayerRec>
-      for (const [uid, rec] of Object.entries(data)) players.set(uid, rec)
-      console.log(`[royale] загружено игроков: ${players.size}`)
-    }
-    if (existsSync(NICKS_PATH)) {
-      const data = JSON.parse(readFileSync(NICKS_PATH, 'utf8')) as Record<string, string>
-      for (const [n, uid] of Object.entries(data)) nickIndex.set(n, uid)
-    }
-  } catch (e) {
-    console.error('[royale] ошибка загрузки хранилища:', e)
+  const url = new URL(req.url || '/', `http://localhost`)
+  if (req.method === 'GET' && url.pathname === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ ok: true, game: 'neon-royale', time: Date.now() }))
+    return
   }
-}
-
-function saveStore() {
-  try {
-    if (!storeDirty) return
-    mkdirSync(DATA_DIR, { recursive: true })
-    const obj: Record<string, PlayerRec> = {}
-    for (const [uid, rec] of players) obj[uid] = rec
-    writeFileSync(PLAYERS_PATH, JSON.stringify(obj))
-    const nicks: Record<string, string> = {}
-    for (const [n, uid] of nickIndex) nicks[n] = uid
-    writeFileSync(NICKS_PATH, JSON.stringify(nicks))
-    storeDirty = false
-  } catch (e) {
-    console.error('[royale] ошибка сохранения:', e)
+  if (req.method === 'GET' && url.pathname === '/api/leaderboard') {
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify(leaderboardTop()))
+    return
   }
-}
-
-function newProfile(uid: string, nick: string): Profile {
-  const cards: Record<string, number> = {}
-  for (const id of DEFAULT_DECK) cards[id] = 1
-  return {
-    uid,
-    nick: nick || 'Командир',
-    gold: 300,
-    trophies: 0,
-    wins: 0,
-    losses: 0,
-    draws: 0,
-    cards,
-    deck: [...DEFAULT_DECK],
-    towerLevel: 1,
-    towerSkin: 'stone',
-    isFox: false,
-    promoUsed: [],
-    vkBonus: false,
-    createdAt: Date.now(),
+  if (req.method === 'GET' && url.pathname === '/api/nick-check') {
+    const nick = (url.searchParams.get('nick') || '').trim()
+    const playerId = url.searchParams.get('playerId') || ''
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify(checkNickFree(nick, playerId)))
+    return
   }
-}
-
-function normalizeNick(raw: unknown): string {
-  if (typeof raw !== 'string') return ''
-  return raw.trim().replace(/\s+/g, ' ').slice(0, 16)
-}
-
-/** Попытка занять ник; true — успех */
-function claimNick(profile: Profile, nick: string): boolean {
-  const key = nick.toLowerCase()
-  const owner = nickIndex.get(key)
-  if (owner && owner !== profile.uid) return false
-  const old = profile.nick.toLowerCase()
-  if (old && old !== key && nickIndex.get(old) === profile.uid) nickIndex.delete(old)
-  nickIndex.set(key, profile.uid)
-  profile.nick = nick
-  return true
-}
-
-// ============================ ПРОМОКОДЫ (только здесь) ============================
-/** XOR-90 обфускация — в исходнике нет читаемых кодов */
-const x90 = (arr: number[]) => arr.map((n) => String.fromCharCode(90 ^ n)).join('')
-
-const PROMOS: Record<string, { gold: number; label: string }> = {
-  [x90([20, 31, 21, 20, 9, 14, 27, 8, 14])]: { gold: 500, label: 'Стартовый неон' },
-  [x90([8, 21, 3, 27, 22, 31])]: { gold: 777, label: 'Рояль-бонус' },
-  [x90([9, 20, 31, 29, 19, 8, 31, 12])]: { gold: 1500, label: 'От студии' },
-  [x90([12, 17, 25, 22, 15, 24])]: { gold: 1000, label: 'ВК-бонус' },
-}
-/** Секретный админ-код: открывает лисьи карты и башню */
-const ADMIN_PROMO = x90([107, 105, 104, 59, 62, 55, 51, 52, 44, 105, 106, 105, 106])
-const FOX_CARDS = ['fox_veteran', 'fox_flame', 'fox_alpha', 'fox_pack', 'fox_tower']
-
-// ============================ ОГРАНИЧЕНИЯ ============================
-const rate = new Map<string, { promo: number[]; login: number[] }>()
-function rateOk(socket: Socket, kind: 'promo' | 'login', limit: number, windowMs: number): boolean {
-  let r = rate.get(socket.id)
-  if (!r) {
-    r = { promo: [], login: [] }
-    rate.set(socket.id, r)
+  if (req.method === 'POST' && url.pathname === '/api/submit-result') {
+    let body = ''
+    req.on('data', (c) => { body += c; if (body.length > 10_000) req.destroy() })
+    req.on('end', () => {
+      try {
+        const d = JSON.parse(body)
+        const r = submitResult(String(d.playerId || ''), String(d.nick || ''), Number(d.trophies), Number(d.wins), Number(d.losses) || 0)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(r))
+      } catch {
+        res.writeHead(400); res.end('{"ok":false}')
+      }
+    })
+    return
   }
-  const arr = r[kind]
-  const now = Date.now()
-  while (arr.length && now - arr[0] > windowMs) arr.shift()
-  if (arr.length >= limit) return false
-  arr.push(now)
-  return true
-}
-
-// ============================ МАТЧМЕЙКИНГ И БОИ ============================
-
-interface QueueItem {
-  socket: Socket
-  uid: string
-  profile: Profile
-  joinedAt: number
-}
-const queue: QueueItem[] = []
-let battleSeq = 0
-
-interface NetBattle {
-  id: string
-  battle: RBattle
-  sides: { 0: string | null; 1: string | null } // uid
-  sockets: { 0: Socket | null; 1: Socket | null }
-  profiles: { 0: Profile | null; 1: Profile | null }
-  tickIv: ReturnType<typeof setInterval>
-  sendIv: ReturnType<typeof setInterval>
-  lastState: { 0: number; 1: number }
-}
-const battles = new Map<string, NetBattle>() // id → battle
-const battleByUid = new Map<string, NetBattle>() // uid → battle
-
-function profileCfg(profile: Profile, isBot: boolean, name?: string): PlayerCfg {
-  return {
-    name: name ?? profile.nick,
-    isBot,
-    isFox: profile.isFox,
-    deck: validDeck(profile.deck, profile.cards) ? [...profile.deck] : [...DEFAULT_DECK],
-    cardLevels: profile.cards,
-    towerLevel: profile.towerLevel,
-    towerSkin: profile.towerSkin,
+  if (req.method === 'POST' && url.pathname === '/api/promo') {
+    let body = ''
+    req.on('data', (c) => { body += c; if (body.length > 2_000) req.destroy() })
+    req.on('end', () => {
+      try {
+        const d = JSON.parse(body)
+        const r = redeemPromo(String(d.playerId || ''), String(d.code || ''))
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(r))
+      } catch {
+        res.writeHead(400); res.end('{"ok":false,"msg":"Ошибка"}')
+      }
+    })
+    return
   }
-}
+  res.writeHead(404); res.end()
+})
 
-function botProfileCfg(myProfile: Profile): PlayerCfg {
-  const avg = Object.values(myProfile.cards).length
-    ? Math.round(Object.values(myProfile.cards).reduce((a, b) => a + b, 0) / Object.values(myProfile.cards).length)
-    : 1
-  const deck = botDeck()
-  const levels: Record<string, number> = {}
-  for (const id of deck) levels[id] = Math.max(1, Math.min(5, myProfile.cards[id] ?? avg))
-  return {
-    name: BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)],
-    isBot: true,
-    isFox: false,
-    deck,
-    cardLevels: levels,
-    towerLevel: Math.max(1, Math.min(5, myProfile.towerLevel)),
-  }
-}
-
-
-function startBattle(a: { socket: Socket; uid: string; profile: Profile }, b: { socket: Socket | null; uid: string; profile: Profile | null }, botCfg?: PlayerCfg) {
-  const id = `b${++battleSeq}-${Date.now().toString(36)}`
-  const players: [PlayerCfg, PlayerCfg] = [
-    profileCfg(a.profile, false),
-    botCfg ?? (b.profile ? profileCfg(b.profile, false) : botProfileCfg(a.profile)),
-  ]
-  const battle = new RBattle({ players: [players[0], players[1]], id, duration: 180 })
-  const nb: NetBattle = {
-    id,
-    battle,
-    sides: { 0: a.uid, 1: b.uid },
-    sockets: { 0: a.socket, 1: b.socket },
-    profiles: { 0: a.profile, 1: b.profile },
-    tickIv: null as unknown as ReturnType<typeof setInterval>,
-    sendIv: null as unknown as ReturnType<typeof setInterval>,
-    lastState: { 0: 0, 1: 0 },
-  }
-  battles.set(id, nb)
-  battleByUid.set(a.uid, nb)
-  if (b.uid) battleByUid.set(b.uid, nb)
-
-  // Сообщаем старт
-  a.socket.emit('r:match:start', { id, foe: { name: players[1].name, isBot: players[1].isBot, isFox: players[1].isFox } })
-  if (b.socket) {
-    b.socket.emit('r:match:start', { id, foe: { name: players[0].name, isBot: false, isFox: players[0].isFox } })
-  }
-
-  nb.tickIv = setInterval(() => {
-    try {
-      battle.tick(1 / 15)
-    } catch (e) {
-      console.error('[royale] tick error:', e)
-    }
-  }, 66)
-  nb.sendIv = setInterval(() => {
-    try {
-      sendState(nb)
-      if (battle.over) finishBattle(nb)
-    } catch (e) {
-      console.error('[royale] state error:', e)
-    }
-  }, 100)
-}
-
-function sendState(nb: NetBattle) {
-  for (const side of [0, 1] as Side[]) {
-    const sock = nb.sockets[side]
-    if (!sock?.connected) continue
-    sock.emit('r:state', nb.battle.serialize(side))
-    nb.lastState[side] = Date.now()
-  }
-}
-
-function applyResult(nb: NetBattle) {
-  const res = nb.battle.results
-  if (!res) return
-  for (const side of [0, 1] as Side[]) {
-    const profile = nb.profiles[side]
-    if (!profile) continue
-    const r = res[side]
-    profile.gold += r.gold
-    profile.trophies = Math.max(0, profile.trophies + r.trophies)
-    if (r.outcome === 'win') profile.wins++
-    else if (r.outcome === 'lose') profile.losses++
-    else profile.draws++
-    markDirty()
-  }
-}
-
-function finishBattle(nb: NetBattle) {
-  applyResult(nb)
-  for (const side of [0, 1] as Side[]) {
-    const sock = nb.sockets[side]
-    if (!sock?.connected) continue
-    sock.emit('r:battle:end')
-    sock.emit('r:state', nb.battle.serialize(side))
-  }
-  clearInterval(nb.tickIv)
-  clearInterval(nb.sendIv)
-  for (const uid of [nb.sides[0], nb.sides[1]]) {
-    if (uid && battleByUid.get(uid) === nb) battleByUid.delete(uid)
-  }
-  battles.delete(nb.id)
-}
-
-// ============================ ПРОФИЛЬ ДЛЯ КЛИЕНТА ============================
-function publicProfile(p: Profile): Profile {
-  return { ...p }
-}
-
-// ============================ СЕРВЕР ============================
-const httpServer = createServer()
 const io = new Server(httpServer, {
-  path: '/',
+  // socket.io на дефолтном пути /socket.io/ — REST (/api/*, /health) остаётся свободным
   cors: { origin: '*', methods: ['GET', 'POST'] },
   pingTimeout: 60000,
   pingInterval: 25000,
 })
 
+process.on('uncaughtException', (e) => console.error('[nr] uncaughtException:', e))
+process.on('unhandledRejection', (e) => console.error('[nr] unhandledRejection:', e))
+
+// ============================ ХРАНИЛИЩЕ ============================
+const DB_DIR = process.env.SNAPSHOT_DIR || join(import.meta.dir, 'db')
+const DB_PATH = join(DB_DIR, 'players.json')
+
+interface Rec { nick: string; trophies: number; wins: number; losses: number; fox: boolean; updatedAt: number }
+interface Db {
+  players: Record<string, Rec>          // playerId -> rec
+  nickIndex: Record<string, string>     // nickLower -> playerId
+  promoGrants: Record<string, number>   // playerId -> ts
+}
+const db: Db = { players: {}, nickIndex: {}, promoGrants: {} }
+let dbDirty = false
+
+function loadDb() {
+  try {
+    if (existsSync(DB_PATH)) {
+      const raw = JSON.parse(readFileSync(DB_PATH, 'utf8'))
+      db.players = raw.players || {}
+      db.nickIndex = raw.nickIndex || {}
+      db.promoGrants = raw.promoGrants || {}
+      console.log(`[nr] db loaded: ${Object.keys(db.players).length} players`)
+    }
+  } catch (e) { console.error('[nr] db load failed', e) }
+}
+function saveDb() {
+  try {
+    if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true })
+    writeFileSync(DB_PATH, JSON.stringify(db))
+    dbDirty = false
+  } catch (e) { console.error('[nr] db save failed', e) }
+}
+loadDb()
+setInterval(() => { if (dbDirty) saveDb() }, 10_000)
+process.on('SIGTERM', () => { saveDb(); process.exit(0) })
+process.on('SIGINT', () => { saveDb(); process.exit(0) })
+
+const ARENAS: Array<[number, string]> = [
+  [0, 'Гнездо гоблинов'], [300, 'Костяная яма'], [600, 'Неоновый дол'],
+  [1000, 'Кристальный пик'], [1500, 'Лавовый кратер'], [2200, 'Небесная арена'],
+  [3000, 'Лисья легенда'],
+]
+function arenaOf(t: number): string {
+  let a = ARENAS[0][1]
+  for (const [min, name] of ARENAS) if (t >= min) a = name
+  return a
+}
+
+const normNick = (n: string) => n.trim().replace(/\s+/g, ' ')
+const lowNick = (n: string) => normNick(n).toLowerCase()
+
+function checkNickFree(nick: string, playerId: string): { ok: boolean; msg?: string } {
+  const n = normNick(nick)
+  if (n.length < 2 || n.length > 16) return { ok: false, msg: 'От 2 до 16 символов' }
+  if (!/^[\p{L}\p{N}_\- ]+$/u.test(n)) return { ok: false, msg: 'Только буквы, цифры, пробел, _ и -' }
+  const low = lowNick(n)
+  const owner = db.nickIndex[low]
+  if (owner && owner !== playerId) return { ok: false, msg: 'Ник уже занят' }
+  return { ok: true }
+}
+
+function upsertPlayer(playerId: string, nick: string): Rec {
+  const low = lowNick(nick)
+  let rec = db.players[playerId]
+  if (!rec) {
+    rec = { nick: normNick(nick), trophies: 0, wins: 0, losses: 0, fox: false, updatedAt: Date.now() }
+    db.players[playerId] = rec
+  }
+  if (rec.nick.toLowerCase() !== low) {
+    delete db.nickIndex[rec.nick.toLowerCase()]
+    rec.nick = normNick(nick)
+  }
+  db.nickIndex[low] = playerId
+  rec.updatedAt = Date.now()
+  dbDirty = true
+  return rec
+}
+
+function submitResult(playerId: string, nick: string, trophies: number, wins: number, losses: number) {
+  if (!playerId || !nick) return { ok: false, msg: 'Нет данных' }
+  const rec = upsertPlayer(playerId, nick)
+  const old = rec.trophies
+  const nt = Math.max(0, Math.round(trophies))
+  // защита от накрутки: за один submit не больше ±40 трофеев
+  if (Math.abs(nt - old) > 40) {
+    rec.trophies = nt > old ? old + 40 : Math.max(0, old - 40)
+  } else {
+    rec.trophies = nt
+  }
+  if (Number.isFinite(wins)) rec.wins = Math.max(rec.wins, Math.round(wins))
+  if (Number.isFinite(losses)) rec.losses = Math.max(rec.losses, Math.round(losses))
+  dbDirty = true
+  return { ok: true, trophies: rec.trophies }
+}
+
+function leaderboardTop() {
+  const rows = Object.values(db.players)
+    .filter(r => r.nick)
+    .sort((a, b) => b.trophies - a.trophies)
+    .slice(0, 100)
+    .map(r => ({ nick: r.nick, trophies: r.trophies, wins: r.wins, arena: arenaOf(r.trophies) }))
+  return rows
+}
+
+// ============================ ПРОМОКОД ============================
+// Код НЕ лежит открытым текстом: XOR-обфускация. Проверка только здесь.
+const PROMO_XOR: number[] = [107, 105, 104, 59, 62, 55, 51, 52, 44, 105, 106, 105, 106]
+const PROMO_KEY = 0x5a
+function decodePromo(): string {
+  let s = ''
+  for (const c of PROMO_XOR) s += String.fromCharCode(c ^ PROMO_KEY)
+  return s
+}
+const promoAttempts = new Map<string, number[]>() // playerId -> ts[]
+function redeemPromo(playerId: string, code: string) {
+  if (!playerId) return { ok: false, msg: 'Нет идентификатора игрока' }
+  const now = Date.now()
+  const arr = (promoAttempts.get(playerId) || []).filter(t => now - t < 60_000)
+  if (arr.length >= 5) return { ok: false, msg: 'Слишком много попыток, подожди минуту' }
+  arr.push(now)
+  promoAttempts.set(playerId, arr)
+  const rec = db.players[playerId]
+  if (!rec) return { ok: false, msg: 'Сначала создай ник в игре' }
+  if (rec.fox || db.promoGrants[playerId]) return { ok: false, msg: 'Лисы уже разблокированы' }
+  const clean = (code || '').trim()
+  if (clean.length !== decodePromo().length || clean !== decodePromo()) {
+    return { ok: false, msg: 'Неверный промокод' }
+  }
+  rec.fox = true
+  db.promoGrants[playerId] = now
+  dbDirty = true
+  return { ok: true, msg: 'Лисий клан разблокирован!' }
+}
+
+// ============================ МАТЧМЕЙКИНГ ============================
+interface QP { sid: string; playerId: string; nick: string; deck: string[]; levels: Record<string, number>; trophies: number; joined: number }
+interface Room { id: string; p0: QP; p1: QP; hostSide: 0 | 1; createdAt: number }
+
+const queue: QP[] = []
+const rooms = new Map<string, Room>()
+const QUEUE_TIMEOUT_MS = 15_000
+
+const bySid = new Map<string, QP>()   // socketId -> queued player info (для register)
+const sidToRoom = new Map<string, string>()
+const uid = () => Math.random().toString(36).slice(2, 10)
+
+function matchFound(a: QP, b: QP) {
+  const roomId = uid()
+  const room: Room = { id: roomId, p0: a, p1: b, hostSide: 0, createdAt: Date.now() }
+  rooms.set(roomId, room)
+  sidToRoom.set(a.sid, roomId)
+  sidToRoom.set(b.sid, roomId)
+  const mk = (me: QP, opp: QP, side: 0 | 1) => ({
+    roomId, seed: Math.floor(Math.random() * 2 ** 31), side, host: side === 0,
+    oppNick: opp.nick, oppDeck: opp.deck, oppLevels: opp.levels, bot: false,
+    yourDeck: me.deck, yourLevels: me.levels,
+  })
+  io.to(a.sid).emit('match', mk(a, b, 0))
+  io.to(b.sid).emit('match', mk(b, a, 1))
+  console.log(`[nr] match ${roomId}: ${a.nick} vs ${b.nick}`)
+}
+
+function matchBot(p: QP) {
+  const roomId = uid()
+  // комната-одиночка: клиент сам симулирует бота локально
+  io.to(p.sid).emit('match', {
+    roomId, seed: Math.floor(Math.random() * 2 ** 31), side: 1, host: true,
+    oppNick: 'Бот', oppDeck: [], oppLevels: {}, bot: true,
+    yourDeck: p.deck, yourLevels: p.levels,
+  })
+  console.log(`[nr] bot match for ${p.nick} (waited ${((Date.now() - p.joined) / 1000).toFixed(1)}s)`)
+}
+
+setInterval(() => {
+  const now = Date.now()
+  // пары из очереди
+  while (queue.length >= 2) {
+    const a = queue.shift()!
+    const b = queue.shift()!
+    const sa = io.sockets.sockets.get(a.sid)
+    const sb = io.sockets.sockets.get(b.sid)
+    if (!sa) { if (sb) queue.unshift(b); continue }
+    if (!sb) { queue.unshift(a); continue }
+    matchFound(a, b)
+  }
+  // таймаут -> бот
+  while (queue.length) {
+    const p = queue[0]
+    if (now - p.joined >= QUEUE_TIMEOUT_MS) {
+      queue.shift()
+      const s = io.sockets.sockets.get(p.sid)
+      if (s) matchBot(p)
+    } else break
+  }
+  // статус поиска
+  for (const p of queue) {
+    io.to(p.sid).emit('queue', { searching: true, elapsed: Math.floor((now - p.joined) / 1000) })
+  }
+}, 1000)
+
 io.on('connection', (socket: Socket) => {
-  let myUid: string | null = null
+  let registered: { playerId: string; nick: string } | null = null
 
-  socket.on('r:login', (d: { uid?: string; nick?: string } | undefined, ack?: (r: unknown) => void) => {
-    if (!rateOk(socket, 'login', 12, 60_000)) return ack?.({ ok: false, error: 'Слишком часто' })
-    const uid = typeof d?.uid === 'string' && d.uid.length <= 64 ? d.uid : ''
-    if (!uid) return ack?.({ ok: false, error: 'Нет uid' })
-    myUid = uid
-    let rec = players.get(uid)
-    let created = false
-    if (!rec) {
-      rec = { profile: newProfile(uid, ''), updatedAt: Date.now() }
-      players.set(uid, rec)
-      created = true
-      markDirty()
-    }
-    const profile = rec.profile
-    let nickTaken = false
-    const nick = normalizeNick(d?.nick)
-    if (nick.length >= 2 && nick !== profile.nick) {
-      if (!claimNick(profile, nick)) nickTaken = true
-      else markDirty()
-    }
-    rec.updatedAt = Date.now()
-    markDirty()
-    ack?.({ ok: true, profile: publicProfile(profile), nickTaken, nick: profile.nick, created })
+  socket.on('register', (d: { playerId: string; nick: string }) => {
+    try {
+      if (!d || !d.playerId) return
+      const nick = normNick(String(d.nick || 'Игрок'))
+      upsertPlayer(String(d.playerId), nick)
+      registered = { playerId: String(d.playerId), nick }
+    } catch (e) { console.error('[nr] register', e) }
   })
 
-  socket.on('r:leaderboard', (_d: unknown, ack?: (r: unknown) => void) => {
-    const rows = [...players.values()]
-      .map((rec) => ({ nick: rec.profile.nick, trophies: rec.profile.trophies, wins: rec.profile.wins }))
-      .sort((a, b) => b.trophies - a.trophies)
-      .slice(0, 100)
-    ack?.({ ok: true, rows })
+  socket.on('queue', (d: { playerId: string; nick: string; deck: string[]; levels: Record<string, number>; trophies: number }) => {
+    try {
+      if (!d || !d.playerId) return
+      const deck = Array.isArray(d.deck) && d.deck.length === 8 ? d.deck.map(String) : []
+      if (!deck.length) return
+      const qp: QP = {
+        sid: socket.id,
+        playerId: String(d.playerId),
+        nick: normNick(String(d.nick || 'Игрок')),
+        deck,
+        levels: typeof d.levels === 'object' && d.levels ? d.levels : {},
+        trophies: Number(d.trophies) || 0,
+        joined: Date.now(),
+      }
+      upsertPlayer(qp.playerId, qp.nick)
+      bySid.set(socket.id, qp)
+      if (!queue.find(x => x.playerId === qp.playerId)) queue.push(qp)
+    } catch (e) { console.error('[nr] queue', e) }
   })
 
-  socket.on('r:profile:get', (_d: unknown, ack?: (r: unknown) => void) => {
-    if (!myUid) return ack?.({ ok: false })
-    const rec = players.get(myUid)
-    ack?.(rec ? { ok: true, profile: publicProfile(rec.profile) } : { ok: false })
+  socket.on('leave_queue', () => {
+    const i = queue.findIndex(q => q.sid === socket.id)
+    if (i >= 0) queue.splice(i, 1)
   })
 
-  // ---------- Очередь ----------
-  socket.on('r:queue:start', (_d: unknown, ack?: (r: unknown) => void) => {
-    if (!myUid) return ack?.({ ok: false, error: 'Сначала войдите' })
-    const rec = players.get(myUid)
-    if (!rec) return ack?.({ ok: false, error: 'Нет профиля' })
-    if (battleByUid.has(myUid)) return ack?.({ ok: true, already: true })
-    if (queue.some((q) => q.uid === myUid)) return ack?.({ ok: true })
-    ack?.({ ok: true })
-    socket.emit('r:search:started')
-    queue.push({ socket, uid: myUid, profile: rec.profile, joinedAt: Date.now() })
+  // релей: гость -> хост
+  socket.on('play', (ev: { seq: number; card: string; x: number; y: number }) => {
+    const roomId = sidToRoom.get(socket.id)
+    if (!roomId) return
+    const room = rooms.get(roomId)
+    if (!room) return
+    const guest = room.hostSide === 0 ? room.p1 : room.p0
+    if (socket.id !== guest.sid) return // только гость шлёт play
+    const host = room.hostSide === 0 ? room.p0 : room.p1
+    socket.to(host.sid).emit('play', { seq: ev.seq, side: guest === room.p0 ? 0 : 1, card: ev.card, x: ev.x, y: ev.y })
   })
 
-  socket.on('r:queue:cancel', () => {
-    const i = queue.findIndex((q) => q.socket.id === socket.id)
-    if (i >= 0) {
-      queue.splice(i, 1)
-      socket.emit('r:search:cancelled')
-    }
-  })
-
-  // ---------- Бой ----------
-  socket.on('r:deploy', async (d: { cardIdx?: number; x?: number; y?: number } | undefined, ack?: (r: unknown) => void) => {
-    if (!myUid) return ack?.({ ok: false, error: 'Нет входа' })
-    const nb = battleByUid.get(myUid)
-    if (!nb) return ack?.({ ok: false, error: 'Бой не активен' })
-    const side = nb.sides[0] === myUid ? 0 : nb.sides[1] === myUid ? 1 : null
-    if (side === null) return ack?.({ ok: false, error: 'Нет стороны' })
-    const idx = typeof d?.cardIdx === 'number' ? Math.max(0, Math.min(3, Math.floor(d.cardIdx))) : -1
-    const x = typeof d?.x === 'number' ? Math.max(-9, Math.min(9, d.x)) : 0
-    const yRaw = typeof d?.y === 'number' ? Math.max(-16.5, Math.min(16.5, d.y)) : 0
-    // Клиент всегда в своей системе (сторона 0 внизу): переводим в мировые координаты
-    const wx = side === 1 ? -x : x
-    const wy = side === 1 ? -yRaw : yRaw
-    const r = nb.battle.deploy(side, idx, wx, wy)
-    ack?.(r)
-  })
-
-  socket.on('r:battle:leave', () => {
-    if (!myUid) return
-    const nb = battleByUid.get(myUid)
-    if (!nb || nb.battle.over) return
-    const side = nb.sides[0] === myUid ? 0 : 1
-    // Сдача: победа сопернику
-    const winner = (side === 0 ? 1 : 0) as Side
-    nb.battle.players[winner].crowns = 3
-    nb.battle.pushFx('crown', nb.battle.towers.find((t) => t.side === side && t.kind === 'king')?.x ?? 0, side === 0 ? 13.8 : -13.8)
-    nb.battle.end(winner)
-    sendState(nb)
-    finishBattle(nb)
-  })
-
-  socket.on('r:rejoin', (_d: unknown, ack?: (r: unknown) => void) => {
-    if (!myUid) return ack?.({ ok: false })
-    const nb = battleByUid.get(myUid)
-    if (!nb || nb.battle.over) return ack?.({ ok: false })
-    const side = nb.sides[0] === myUid ? 0 : 1
-    // Перепривязываем сокет
-    nb.sockets[side] = socket
-    ack?.({ ok: true, battle: nb.battle.serialize(side) })
-  })
-
-  // ---------- Магазин (сервер валидирует золото) ----------
-  socket.on('r:shop', (d: { action?: string; card?: string } | undefined, ack?: (r: unknown) => void) => {
-    if (!myUid) return ack?.({ ok: false, error: 'Нет входа' })
-    const rec = players.get(myUid)
-    if (!rec) return ack?.({ ok: false, error: 'Нет профиля' })
-    const p = rec.profile
-    const action = d?.action ?? ''
-    const respond = (r: Record<string, unknown>) => ack?.(r)
-
-    if (action === 'buyCard') {
-      const def = d?.card ? CARD_MAP[d.card] : null
-      if (!def || def.unlock !== 'shop' || !def.shopPrice) return respond({ ok: false, error: 'Карта не продаётся' })
-      if (p.cards[def.id]) return respond({ ok: false, error: 'Уже куплена' })
-      if (p.gold < def.shopPrice) return respond({ ok: false, error: `Не хватает ${def.shopPrice - p.gold} золота` })
-      p.gold -= def.shopPrice
-      p.cards[def.id] = 1
-      markDirty()
-      return respond({ ok: true, profile: publicProfile(p), label: `${def.name} куплена!` })
-    }
-    if (action === 'upCard') {
-      const def = d?.card ? CARD_MAP[d.card] : null
-      if (!def || !p.cards[def.id]) return respond({ ok: false, error: 'Карты нет' })
-      const lvl = p.cards[def.id]
-      if (lvl >= MAX_CARD_LEVEL) return respond({ ok: false, error: 'Максимальный уровень' })
-      const cost = nextUpgradeCost(lvl)
-      if (p.gold < cost) return respond({ ok: false, error: `Не хватает ${cost - p.gold} золота` })
-      p.gold -= cost
-      p.cards[def.id] = lvl + 1
-      markDirty()
-      return respond({ ok: true, profile: publicProfile(p), label: `${def.name} — уровень ${lvl + 1}!` })
-    }
-    if (action === 'upTowers') {
-      if (p.towerLevel >= MAX_TOWER_LEVEL) return respond({ ok: false, error: 'Максимальный уровень' })
-      const cost = TOWER_LEVEL_COSTS[p.towerLevel - 1]
-      if (p.gold < cost) return respond({ ok: false, error: `Не хватает ${cost - p.gold} золота` })
-      p.gold -= cost
-      p.towerLevel++
-      markDirty()
-      return respond({ ok: true, profile: publicProfile(p), label: `Башни усилены до ур. ${p.towerLevel}!` })
-    }
-    if (action === 'buyTower') {
-      const sk = towerSkin(d?.card ?? '')
-      if (!sk.price || sk.price <= 0 || sk.fox) return respond({ ok: false, error: 'Эта башня не продаётся' })
-      p.skins = p.skins ?? []
-      if (p.skins.includes(sk.id) || p.towerSkin === sk.id) return respond({ ok: false, error: 'Уже открыта' })
-      if (p.gold < sk.price) return respond({ ok: false, error: `Не хватает ${sk.price - p.gold} золота` })
-      p.gold -= sk.price
-      p.skins.push(sk.id)
-      p.towerSkin = sk.id
-      markDirty()
-      return respond({ ok: true, profile: publicProfile(p), label: `Башня «${sk.name}» куплена!` })
-    }
-    if (action === 'vkBonus') {
-      if (p.vkBonus) return respond({ ok: false, error: 'Бонус уже получен' })
-      p.vkBonus = true
-      p.gold += 300
-      markDirty()
-      return respond({ ok: true, profile: publicProfile(p), label: 'Бонус ВКонтакте: +300 золота!' })
-    }
-    respond({ ok: false, error: 'Неизвестное действие' })
-  })
-
-  socket.on('r:deck:save', (d: { deck?: string[] } | undefined, ack?: (r: unknown) => void) => {
-    if (!myUid) return ack?.({ ok: false, error: 'Нет входа' })
-    const rec = players.get(myUid)
-    if (!rec) return ack?.({ ok: false, error: 'Нет профиля' })
-    const deck = Array.isArray(d?.deck) ? d!.deck!.map(String) : []
-    if (!validDeck(deck, rec.profile.cards)) return ack?.({ ok: false, error: 'Некорректная колода' })
-    rec.profile.deck = deck
-    markDirty()
-    ack?.({ ok: true, profile: publicProfile(rec.profile) })
-  })
-
-  socket.on('r:cosmetics', (d: { towerSkin?: string } | undefined) => {
-    if (!myUid) return
-    const rec = players.get(myUid)
-    if (!rec) return
-    const sk = towerSkin(d?.towerSkin ?? '')
-    const p = rec.profile
-    const owned = (p.skins ?? []).includes(sk.id)
-    if (
-      sk.id !== p.towerSkin &&
-      !owned &&
-      sk.price !== 0 &&
-      !(sk.unlockTrophies >= 0 && p.trophies >= sk.unlockTrophies) &&
-      !(sk.fox && p.isFox)
-    ) {
-      return
-    }
-    p.towerSkin = sk.id
-    markDirty()
-  })
-
-  // ---------- Промокоды ----------
-  socket.on('r:promo', (d: { code?: string } | undefined, ack?: (r: unknown) => void) => {
-    if (!rateOk(socket, 'promo', 5, 60_000)) return ack?.({ ok: false, error: 'Слишком много попыток, подожди минуту' })
-    if (!myUid) return ack?.({ ok: false, error: 'Нет входа' })
-    const rec = players.get(myUid)
-    if (!rec) return ack?.({ ok: false, error: 'Нет профиля' })
-    const code = typeof d?.code === 'string' ? d.code.trim().toUpperCase() : ''
-    if (!code) return ack?.({ ok: false, error: 'Введите код' })
-    const p = rec.profile
-
-    if (code === ADMIN_PROMO) {
-      if (p.isFox) return ack?.({ ok: true, fox: true, profile: publicProfile(p), label: 'Лисий доступ уже открыт' })
-      p.isFox = true
-      for (const c of FOX_CARDS) if (!p.cards[c]) p.cards[c] = 1
-      if (!p.skins) p.skins = []
-      if (!p.skins.includes('foxtower')) p.skins.push('foxtower')
-      p.towerSkin = 'foxtower'
-      markDirty()
-      console.log('[royale] админ-доступ выдан')
-      return ack?.({ ok: true, fox: true, profile: publicProfile(p), label: 'Лисий доступ открыт!' })
-    }
-
-    const promo = PROMOS[code]
-    if (!promo) return ack?.({ ok: false, error: 'Код не найден' })
-    if (p.promoUsed.includes(code)) return ack?.({ ok: false, error: 'Код уже использован' })
-    p.promoUsed.push(code)
-    p.gold += promo.gold
-    markDirty()
-    ack?.({ ok: true, gold: promo.gold, profile: publicProfile(p), label: `${promo.label}: +${promo.gold} золота!` })
+  // релей: хост -> гость
+  socket.on('snapshot', (roomId: string, snap: unknown) => {
+    const room = rooms.get(String(roomId))
+    if (!room) return
+    const host = room.hostSide === 0 ? room.p0 : room.p1
+    if (socket.id !== host.sid) return
+    const guest = room.hostSide === 0 ? room.p1 : room.p0
+    socket.to(guest.sid).emit('snapshot', snap)
   })
 
   socket.on('disconnect', () => {
-    const i = queue.findIndex((q) => q.socket.id === socket.id)
+    const i = queue.findIndex(q => q.sid === socket.id)
     if (i >= 0) queue.splice(i, 1)
-    const nb = myUid ? battleByUid.get(myUid) : null
-    if (nb && !nb.battle.over) {
-      const side = nb.sides[0] === myUid ? 0 : 1
-      if (nb.sockets[side] === socket) nb.sockets[side] = null
-      // Бой продолжается: игрок может вернуться (r:rejoin). Соперник доигрывает.
+    bySid.delete(socket.id)
+    const roomId = sidToRoom.get(socket.id)
+    if (roomId) {
+      const room = rooms.get(roomId)
+      if (room) {
+        const other = room.p0.sid === socket.id ? room.p1 : room.p0
+        socket.to(other.sid).emit('opp_left')
+      }
+      rooms.delete(roomId)
+      sidToRoom.delete(socket.id)
     }
   })
 })
 
-// ============================ ТИКЕР ОЧЕРЕДИ ============================
-setInterval(() => {
-  const now = Date.now()
-  // Пара живых игроков: сортируем по трофеям и склеиваем соседей
-  const humans = queue.filter((q) => q.socket.connected)
-  for (let i = queue.length - 1; i >= 0; i--) if (!queue[i].socket.connected) queue.splice(i, 1)
-  if (humans.length >= 2) {
-    humans.sort((a, b) => a.profile.trophies - b.profile.trophies)
-    const a = humans[0]
-    const b = humans[1]
-    const ia = queue.findIndex((q) => q.uid === a.uid)
-    const ib = queue.findIndex((q) => q.uid === b.uid)
-    if (ia >= 0 && ib >= 0) {
-      queue.splice(Math.max(ia, ib), 1)
-      queue.splice(Math.min(ia, ib), 1)
-      startBattle(a, { socket: b.socket, uid: b.uid, profile: b.profile })
-    }
-    return
-  }
-  // Таймаут 13.5с → бой с ботом на сервере (трофеи засчитываются)
-  for (const q of [...queue]) {
-    if (now - q.joinedAt >= 13_500) {
-      const idx = queue.findIndex((x) => x.uid === q.uid)
-      if (idx >= 0) {
-        queue.splice(idx, 1)
-        startBattle(q, { socket: null, uid: '', profile: null })
-      }
-    }
-  }
-}, 1000)
-
-// ============================ СТАРТ ============================
-const PORT = Number(process.env.GAME_PORT || process.env.PORT || 3003)
-loadStore()
-setInterval(saveStore, 5000)
 httpServer.listen(PORT, () => {
-  console.log(`[royale] сервер запущен на порту ${PORT}`)
+  console.log(`[nr] Neon Royale server on :${PORT}`)
 })

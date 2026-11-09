@@ -16,7 +16,7 @@ export const metadata: Metadata = {
   title: "Neon Royale — онлайн-битва 1 на 1",
   description:
     "Неоновая арена в стиле Clash Royale: перетаскивай карточки воинов на поле, разрушай башни соперника, побеждай в дуэлях 1 на 1.",
-  keywords: ["игра", "рояль", "башни", "мультиплеер", "онлайн", "карточки"],
+  keywords: ["игра", "стратегия", "карты", "дуэль", "онлайн"],
   manifest: "/manifest.json",
   icons: {
     icon: "/icon-192.png",
@@ -24,7 +24,7 @@ export const metadata: Metadata = {
   },
   openGraph: {
     title: "Neon Royale",
-    description: "Неоновая арена 1 на 1: карты героев, башни, дуэли",
+    description: "Онлайн-битва 1 на 1: карты героев, башни, арена",
     type: "website",
   },
 };

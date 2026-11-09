@@ -1,5 +1,5 @@
-[providers]
-bun = true
+[phases.setup]
+nixPkgs = ["bun"]
 
 [start]
-cmd = "bun run start"
+cmd = "bun index.ts"

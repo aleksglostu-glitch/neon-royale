@@ -2,6 +2,7 @@
   "name": "neon-towers-apk",
   "version": "1.0.0",
   "private": true,
+  "browserslist": ["chrome >= 61", "and_chr >= 61", "android >= 6"],
   "scripts": {
     "build": "next build"
   },
