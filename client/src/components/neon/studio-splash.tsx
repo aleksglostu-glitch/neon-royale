@@ -8,23 +8,27 @@
 import { useEffect, useRef, useState } from 'react'
 
 export default function StudioSplash({ seconds = 3, onDone }: { seconds?: number; onDone?: () => void }) {
-  const [phase, setPhase] = useState<'in' | 'hold' | 'out' | 'gone'>('in')
+  const [phase, setPhase] = useState<'in' | 'hold' | 'out' | 'final' | 'gone'>('in')
   const doneRef = useRef(false)
 
   useEffect(() => {
-    const inMs = Math.round(seconds * 1000 * 0.45)
-    const outMs = Math.round(seconds * 1000 * 0.55)
+    const total = seconds * 1000
+    const inMs = Math.round(total * 0.45)
+    const outMs = Math.round(total * 0.28)
+    const finalMs = 250
     const t1 = setTimeout(() => setPhase('hold'), inMs)
-    const t2 = setTimeout(() => setPhase('out'), inMs + Math.max(0, seconds * 1000 - inMs - outMs))
-    const t3 = setTimeout(() => {
+    const t2 = setTimeout(() => setPhase('out'), total - outMs - finalMs)
+    const t3 = setTimeout(() => setPhase('final'), total - finalMs)
+    const t4 = setTimeout(() => {
       setPhase('gone')
       doneRef.current = true
       onDone?.()
-    }, seconds * 1000)
+    }, total)
     return () => {
       clearTimeout(t1)
       clearTimeout(t2)
       clearTimeout(t3)
+      clearTimeout(t4)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -42,13 +46,14 @@ export default function StudioSplash({ seconds = 3, onDone }: { seconds?: number
     <div
       className="fixed inset-0 z-[100] flex items-center justify-center bg-black select-none"
       style={{
-        // Проявление: чёрный уходит; затемнение в конце: чёрный возвращается
-        opacity: phase === 'in' ? undefined : 1,
+        // Фон чёрный держится до самого конца: в фазе out гаснет только лого,
+        // затемнение происходит в конце; финальные 250мс — быстрый уход
+        opacity: phase === 'final' ? undefined : 1,
         animation:
           phase === 'in'
             ? 'nrSplashIn 1.2s ease-out both'
-            : phase === 'out'
-              ? 'nrSplashOut 1.5s ease-in both'
+            : phase === 'final'
+              ? 'nrSplashOut 0.25s ease-in both'
               : undefined,
         cursor: 'pointer',
       }}
@@ -63,7 +68,7 @@ export default function StudioSplash({ seconds = 3, onDone }: { seconds?: number
             phase === 'in'
               ? 'nrLogoIn 1.4s cubic-bezier(0.22,1,0.36,1) both'
               : phase === 'out'
-                ? 'nrLogoOut 1.5s ease-in both'
+                ? 'nrLogoOut 0.85s ease-in both'
                 : undefined,
         }}
       >
