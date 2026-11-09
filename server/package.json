@@ -1,0 +1,11 @@
+{
+  "name": "neon-royale-server",
+  "version": "2.0.0",
+  "private": true,
+  "scripts": {
+    "start": "bun index.ts"
+  },
+  "dependencies": {
+    "socket.io": "^4.8.1"
+  }
+}

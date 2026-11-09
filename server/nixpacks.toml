@@ -1,0 +1,5 @@
+[providers]
+bun = true
+
+[start]
+cmd = "bun run start"
